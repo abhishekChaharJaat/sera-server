@@ -52,12 +52,16 @@ async def chat(thread_id: str, body: ChatRequest):
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
+    # Build conversation history from thread
+    history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for msg in thread.get("messages", []):
+        if msg["role"] in ("user", "assistant"):
+            history.append({"role": msg["role"], "content": msg["content"]})
+    history.append({"role": "user", "content": body.message})
+
     # Get AI response
     chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": body.message},
-        ],
+        messages=history,
         model="llama-3.1-8b-instant",
     )
     response = chat_completion.choices[0].message.content

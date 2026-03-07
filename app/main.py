@@ -30,5 +30,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return "Hello World"
 app.include_router(threads.router)
 app.include_router(chat.router)
