@@ -1,15 +1,19 @@
 import os
+import json
 from bson import ObjectId
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from groq import Groq
+from groq import AsyncGroq
 from app.db.mongo import get_db
 
 router = APIRouter()
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Async Groq client for non-blocking streaming
+client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# System prompt that defines the AI's personality and knowledge about its creator
 SYSTEM_PROMPT = """You are a highly capable AI assistant built by Abhishek Chahar. You provide clear, concise, and accurate responses. You are professional, helpful, and direct. You avoid unnecessary filler, stay on topic, and adapt your tone to the user's needs.
 
 About your creator — Abhishek Chahar:
@@ -26,57 +30,108 @@ About your creator — Abhishek Chahar:
 IMPORTANT: Only mention Abhishek Chahar or his portfolio when the user directly asks about him, who created you, or who you are. Never bring up Abhishek, his portfolio link, or his details in any other context. Do not share his personal contact details (phone or email)."""
 
 
-def generate_title(message: str) -> str:
-    title = message[:20].strip()
-    if len(message) > 20:
-        title += "..."
-    return title
+async def generate_title(message: str) -> str:
+    # Ask AI to generate a short, relevant title based on the first user message
+    completion = await client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Generate a short chat title (max 50 characters, no quotes, no punctuation at end) "
+                    f"that is specific to this exact message. Use key terms or the actual subject from the message — "
+                    f"do NOT use generic labels like 'Math problem' or 'Question'. "
+                    f"Message: {message}"
+                ),
+            }
+        ],
+        model="llama-3.1-8b-instant",
+    )
+    return completion.choices[0].message.content.strip()[:50]
 
 
+# Request body schema
 class ChatRequest(BaseModel):
     message: str
 
 
-class ChatResponse(BaseModel):
-    thread_id: str
-    id: str
-    message: str
+def sse(data: dict) -> str:
+    # Format a dict as an SSE data event
+    return f"data: {json.dumps(data)}\n\n"
 
 
-@router.post("/{thread_id}/chat", response_model=ChatResponse)
+@router.post("/{thread_id}/chat")
 async def chat(thread_id: str, body: ChatRequest):
     db = get_db()
 
-    # Verify thread exists
+    # Verify the thread exists
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    # Build conversation history from thread
+    now = datetime.now(timezone.utc)
+
+    # Check if this is the first message in the thread (used for title generation)
+    is_first_message = len(thread.get("messages", [])) == 0
+
+    # Save user message to DB immediately before streaming
+    user_msg = {"_id": ObjectId(), "role": "user", "content": body.message, "timestamp": now}
+    await db.threads.update_one(
+        {"thread_id": thread_id},
+        {"$push": {"messages": user_msg}},
+    )
+
+    # Build full conversation history to give the AI context of previous messages
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in thread.get("messages", []):
         if msg["role"] in ("user", "assistant"):
             history.append({"role": msg["role"], "content": msg["content"]})
+    # Append the current user message at the end
     history.append({"role": "user", "content": body.message})
 
-    # Get AI response
-    chat_completion = client.chat.completions.create(
-        messages=history,
-        model="llama-3.1-8b-instant",
-    )
-    response = chat_completion.choices[0].message.content
+    async def stream():
+        # Send the user message instantly so frontend can render it right away
+        yield sse({"type": "user_message", "id": str(user_msg["_id"]), "content": body.message})
 
-    now = datetime.now(timezone.utc)
+        # On first message — generate an AI title and send it before chat stream starts
+        if is_first_message:
+            title = await generate_title(body.message)
+            # Save the AI-generated title to DB
+            await db.threads.update_one(
+                {"thread_id": thread_id},
+                {"$set": {"title": title}},
+            )
+            yield sse({"type": "title", "title": title})
 
-    user_msg = {"role": "user", "content": body.message, "timestamp": now}
-    assistant_msg = {"_id": ObjectId(), "role": "assistant", "content": response, "timestamp": now}
+        # Pre-generate the assistant message ID before streaming starts
+        assistant_id = str(ObjectId())
+        full_response = ""
 
-    # Build update — generate title from AI on first message
-    is_first_message = len(thread.get("messages", [])) == 0
-    update: dict = {"$push": {"messages": {"$each": [user_msg, assistant_msg]}}}
-    if is_first_message:
-        update["$set"] = {"title": generate_title(body.message)}
+        # Stream AI response from Groq token by token
+        async with await client.chat.completions.create(
+            messages=history,
+            model="llama-3.1-8b-instant",
+            stream=True,
+        ) as stream_response:
+            async for chunk in stream_response:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    full_response += delta
+                    # Send each token chunk to the frontend
+                    yield sse({"type": "chunk", "content": delta})
 
-    await db.threads.update_one({"thread_id": thread_id}, update)
+        # Save the complete assistant response to DB after streaming finishes
+        assistant_msg = {
+            "_id": ObjectId(assistant_id),
+            "role": "assistant",
+            "content": full_response,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        await db.threads.update_one(
+            {"thread_id": thread_id},
+            {"$push": {"messages": assistant_msg}},
+        )
 
-    return {"thread_id": thread_id, "id": str(assistant_msg["_id"]), "message": response}
+        # Notify frontend that streaming is complete with the final message ID
+        yield sse({"type": "done", "id": assistant_id})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
