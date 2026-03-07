@@ -142,3 +142,6 @@ async def generate_response(thread_id: str):
         yield sse({"type": "done", "id": assistant_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+    #empty
