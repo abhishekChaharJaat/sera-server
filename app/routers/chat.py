@@ -2,11 +2,12 @@ import os
 import json
 from bson import ObjectId
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from groq import AsyncGroq
 from app.db.mongo import get_db
+from app.auth import get_auth_user, AuthUser
 
 router = APIRouter()
 
@@ -57,12 +58,15 @@ def sse(data: dict) -> str:
 
 
 @router.post("/{thread_id}/send-message")
-async def send_message(thread_id: str, body: ChatRequest):
+async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    if thread.get("user_id") != auth_user.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     now = datetime.now(timezone.utc)
     user_msg = {"_id": ObjectId(), "role": "user", "content": body.message, "timestamp": now}
@@ -79,12 +83,15 @@ async def send_message(thread_id: str, body: ChatRequest):
 
 
 @router.post("/{thread_id}/generate-response")
-async def generate_response(thread_id: str):
+async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    if thread.get("user_id") != auth_user.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     messages = thread.get("messages", [])
 
