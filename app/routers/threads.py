@@ -45,6 +45,25 @@ async def list_threads(user: AuthUser = Depends(get_auth_user)):
     return threads
 
 
+@router.delete("/{thread_id}/delete-thread")
+async def delete_thread(thread_id: str, user: AuthUser = Depends(get_auth_user)):
+    if user.auth_type == "anon_user":
+        raise HTTPException(status_code=403, detail="Anonymous users cannot delete threads")
+
+    db = get_db()
+
+    thread = await db.threads.find_one({"thread_id": thread_id})
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    if thread.get("user_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    await db.threads.delete_one({"thread_id": thread_id})
+
+    return {"message": "Thread deleted successfully"}
+
+
 @router.get("/{thread_id}/list-messages")
 async def list_messages(thread_id: str, user: AuthUser = Depends(get_auth_user)):
     db = get_db()
