@@ -1,9 +1,12 @@
 import os
+import uuid
+import base64
 import json
 from bson import ObjectId
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from typing import List, Optional
 from pydantic import BaseModel
 from groq import AsyncGroq
 from app.db.mongo import get_db
@@ -11,6 +14,9 @@ from app.auth import get_auth_user, AuthUser
 from app.prompts import SYSTEM_PROMPT
 
 router = APIRouter()
+
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Async Groq client for non-blocking streaming
 client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -33,8 +39,15 @@ async def generate_title(message: str) -> str:
     return completion.choices[0].message.content.strip()[:50]
 
 
+class AttachmentInput(BaseModel):
+    filename: str
+    content_type: str
+    data: str  # base64 encoded
+
+
 class ChatRequest(BaseModel):
     message: str
+    attachments: Optional[List[AttachmentInput]] = []
 
 
 def sse(data: dict) -> str:
@@ -52,8 +65,44 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
     if thread.get("user_id") != auth_user.user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # Save uploaded files
+    attachments = []
+    for att in (body.attachments or []):
+        file_id = str(uuid.uuid4()) #Generates a unique ID for each file using UUID v4
+        ext = os.path.splitext(att.filename)[1] #Extracts the file extension from the original filename
+        saved_name = f"{file_id}{ext}" #Combines the unique file_id with the original extension to create the server-side filename.
+        file_path = os.path.join(UPLOAD_DIR, saved_name) #Builds the full path where the file will be saved
+        content = base64.b64decode(att.data) #This line decodes the base64 string back to raw bytes so it can be written to disk
+
+        # Opens the target file path in binary write mode (wb).
+        # Writes the raw bytes (content) to the file.
+        # This actually saves the file to the server.
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        if len(content) > 5 * 1024 * 1024:
+            status, reason = "failed", "File size limit exceeded (max 5MB)"
+        else:
+            status, reason = "success", ""
+
+        attachments.append({
+            "file_id": file_id,
+            "filename": att.filename,
+            "content_type": att.content_type,
+            "size": len(content),
+            "path": file_path,
+            "status": status,
+            "reason": reason
+        })
+
     now = datetime.now(timezone.utc)
-    user_msg = {"_id": ObjectId(), "role": "user", "content": body.message, "timestamp": now}
+    user_msg = {
+        "_id": ObjectId(),
+        "role": "user",
+        "content": body.message,
+        "timestamp": now,
+        **({"attachments": attachments} if attachments else {}),
+    }
 
     await db.threads.update_one(
         {"thread_id": thread_id},
@@ -61,7 +110,12 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
     )
 
     async def stream():
-        yield sse({"type": "user_message", "id": str(user_msg["_id"]), "content": body.message})
+        yield sse({
+            "type": "user_message",
+            "id": str(user_msg["_id"]),
+            "content": body.message,
+            "attachments": [{"file_id": a["file_id"], "filename": a["filename"], "content_type": a["content_type"], "size": a["size"]} for a in attachments],
+        })
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
