@@ -238,3 +238,6 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
         yield sse({"type": "done", "id": assistant_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+

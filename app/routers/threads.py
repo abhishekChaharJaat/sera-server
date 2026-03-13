@@ -28,6 +28,7 @@ async def create_thread(user: AuthUser = Depends(get_auth_user)):
         "created_at": thread["created_at"],
     }
 
+# ========================== List threads =========================
 
 @router.get("/list-threads")
 async def list_threads(user: AuthUser = Depends(get_auth_user)):
@@ -44,6 +45,7 @@ async def list_threads(user: AuthUser = Depends(get_auth_user)):
     threads = await cursor.to_list(length=None)
     return threads
 
+# ========================== Dlete thread =========================
 
 @router.delete("/{thread_id}/delete-thread")
 async def delete_thread(thread_id: str, user: AuthUser = Depends(get_auth_user)):
@@ -63,6 +65,7 @@ async def delete_thread(thread_id: str, user: AuthUser = Depends(get_auth_user))
 
     return {"message": "Thread deleted successfully"}
 
+# ========================== List messages =========================
 
 @router.get("/{thread_id}/list-messages")
 async def list_messages(thread_id: str, user: AuthUser = Depends(get_auth_user)):
@@ -74,6 +77,28 @@ async def list_messages(thread_id: str, user: AuthUser = Depends(get_auth_user))
 
     if thread.get("user_id") != user.user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    messages = []
+    for msg in thread.get("messages", []):
+        msg["_id"] = str(msg["_id"]) if "_id" in msg else None
+        messages.append(msg)
+
+    return {
+        "thread_id": thread["thread_id"],
+        "title": thread["title"],
+        "messages": messages,
+        "created_at": thread["created_at"],
+    }
+
+# ========================== Shared messages =========================
+
+@router.get("/{thread_id}/get-shared-messages")
+async def list_messages(thread_id: str):
+    db = get_db()
+
+    thread = await db.threads.find_one({"thread_id": thread_id})
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
 
     messages = []
     for msg in thread.get("messages", []):

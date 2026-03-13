@@ -2,6 +2,10 @@ Company Overview
 ----------------
 Sera is an AI-powered conversational assistant platform built to provide intelligent, context-aware responses for businesses and individuals. Sera is designed to handle general questions, answer queries from uploaded documents, and provide company-specific knowledge in real time.
 
+Founded
+-------
+Sera was founded on 1st March 2026.
+
 Founder
 -------
 Sera was founded and built by Abhishek Chahar, a Software Engineer and AI Engineer passionate about building intelligent systems and scalable applications. Abhishek created Sera with the goal of making AI assistants more useful, reliable, and context-aware for real-world use cases.
