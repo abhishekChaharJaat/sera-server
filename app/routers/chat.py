@@ -2,41 +2,48 @@ import os
 import uuid
 import base64
 import json
+import asyncio
 from bson import ObjectId
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 from pydantic import BaseModel
-from groq import AsyncGroq
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from app.db.mongo import get_db
 from app.auth import get_auth_user, AuthUser
-from app.prompts import SYSTEM_PROMPT
+from app.prompts import AGENT_SYSTEM_PROMPT
+from app.helpers.ingets import ingest_file
+from app.helpers.chat_helpers import generate_title
 
 router = APIRouter()
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
+CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
+COMPANY_CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_company_db")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Async Groq client for non-blocking streaming
-client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model="llama-3.3-70b-versatile",
+    temperature=0
+)
 
-async def generate_title(message: str) -> str:
-    completion = await client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Generate a short chat title (max 50 characters, no quotes, no punctuation at end) "
-                    f"that is specific to this exact message. Use key terms or the actual subject from the message — "
-                    f"do NOT use generic labels like 'Math problem' or 'Question'. "
-                    f"Message: {message}"
-                ),
-            }
-        ],
-        model="llama-3.1-8b-instant",
-    )
-    return completion.choices[0].message.content.strip()[:50]
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# Company docs retriever — loaded once at module level
+company_vector_db = Chroma(
+    persist_directory=COMPANY_CHROMA_DIR,
+    embedding_function=embeddings
+)
+company_retriever = company_vector_db.as_retriever(search_kwargs={"k": 3})
+
 
 
 class AttachmentInput(BaseModel):
@@ -68,15 +75,13 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
     # Save uploaded files
     attachments = []
     for att in (body.attachments or []):
-        file_id = str(uuid.uuid4()) #Generates a unique ID for each file using UUID v4
-        ext = os.path.splitext(att.filename)[1] #Extracts the file extension from the original filename
-        saved_name = f"{file_id}{ext}" #Combines the unique file_id with the original extension to create the server-side filename.
-        file_path = os.path.join(UPLOAD_DIR, saved_name) #Builds the full path where the file will be saved
-        content = base64.b64decode(att.data) #This line decodes the base64 string back to raw bytes so it can be written to disk
+        file_id = str(uuid.uuid4())
+        ext = os.path.splitext(att.filename)[1]
+        saved_name = f"{file_id}{ext}"
+        file_path = os.path.join(UPLOAD_DIR, saved_name)
+        content = base64.b64decode(att.data)
 
-        # Opens the target file path in binary write mode (wb).
-        # Writes the raw bytes (content) to the file.
-        # This actually saves the file to the server.
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
         with open(file_path, "wb") as f:
             f.write(content)
 
@@ -84,6 +89,7 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
             status, reason = "failed", "File size limit exceeded (max 5MB)"
         else:
             status, reason = "success", ""
+            await asyncio.to_thread(ingest_file, file_path, file_id, thread_id)
 
         attachments.append({
             "file_id": file_id,
@@ -120,10 +126,13 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+# ========================== Generate resopnse =========================
+
 @router.post("/{thread_id}/generate-response")
 async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
+    # Fetch thread and validate ownership
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -133,26 +142,70 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
 
     messages = thread.get("messages", [])
 
-    # Find the last user message
+    # Get the last user message to generate a response for
     last_user_msg = next(
         (m for m in reversed(messages) if m["role"] == "user"), None
     )
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="No user message found in thread")
 
-    # First message = no assistant messages yet
+    # Check if this is the first message (no assistant reply yet) — used for title generation
     is_first_message = not any(m["role"] == "assistant" for m in messages)
 
-    # Build conversation history
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for msg in messages:
-        if msg["role"] in ("user", "assistant"):
-            history.append({"role": msg["role"], "content": msg["content"]})
+    # Use message content as query; if empty (file only), default to summarize
+    user_input = last_user_msg["content"].strip()
+    if not user_input and last_user_msg.get("attachments"):
+        user_input = "Summarize the uploaded document briefly."
+
+    # ── RAG: Retrieve relevant chunks from uploaded documents ──
+    # If current message has attachments, search only those specific files by file_id
+    # Otherwise search all files uploaded in this thread by thread_id
+    thread_vector_db = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings
+    )
+    current_attachments = last_user_msg.get("attachments", [])
+    if current_attachments:
+        file_ids = [a["file_id"] for a in current_attachments]
+       # $in ka matlab: match any of these file_ids. - $eq ka matlab: exactly match this file_id.
+        chroma_filter = {"file_id": {"$in": file_ids}} if len(file_ids) > 1 else {"file_id": {"$eq": file_ids[0]}}
+    else:
+        chroma_filter = {"thread_id": {"$eq": thread_id}}
+
+    thread_docs = await asyncio.to_thread(
+        lambda: thread_vector_db.similarity_search(user_input, k=5, filter=chroma_filter)
+    )
+
+    # ── RAG: Retrieve relevant chunks from company knowledge base ──
+    company_docs = await asyncio.to_thread(
+        lambda: company_retriever.invoke(user_input)
+    )
+
+    # ── Build system prompt — inject retrieved context ──
+    # Start with base agent prompt, then append doc/company context if found
+    system_content = AGENT_SYSTEM_PROMPT
+    if thread_docs:
+        doc_context = "\n\n".join(d.page_content for d in thread_docs)
+        system_content += f"\n\n[Uploaded Document Context]\n{doc_context}"
+    if company_docs:
+        company_context = "\n\n".join(d.page_content for d in company_docs)
+        system_content += f"\n\n[Company Information]\n{company_context}"
+
+    # ── Build full message list for LLM ──
+    # System message first, then last 12 conversation messages, then current user message
+    all_messages = [SystemMessage(content=system_content)]
+    for msg in messages[:-1][-12:]:
+        if msg["role"] == "user":
+            all_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            all_messages.append(AIMessage(content=msg["content"]))
+    all_messages.append(HumanMessage(content=user_input))
 
     async def stream():
-        # Generate and send title on first message
+
+        # Generate and send thread title on the first message
         if is_first_message:
-            title = await generate_title(last_user_msg["content"])
+            title = await generate_title(last_user_msg["content"] or user_input)
             await db.threads.update_one(
                 {"thread_id": thread_id},
                 {"$set": {"title": title}},
@@ -162,17 +215,14 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
         assistant_id = str(ObjectId())
         full_response = ""
 
-        async with await client.chat.completions.create(
-            messages=history,
-            model="llama-3.1-8b-instant",
-            stream=True,
-        ) as stream_response:
-            async for chunk in stream_response:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    full_response += delta
-                    yield sse({"type": "chunk", "content": delta})
+        # Stream LLM response chunk by chunk
+        async for chunk in llm.astream(all_messages):
+            delta = chunk.content
+            if delta:
+                full_response += delta
+                yield sse({"type": "chunk", "content": delta})
 
+        # Save complete assistant message to MongoDB
         assistant_msg = {
             "_id": ObjectId(assistant_id),
             "role": "assistant",
@@ -184,9 +234,7 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
             {"$push": {"messages": assistant_msg}},
         )
 
+        # Signal stream completion
         yield sse({"type": "done", "id": assistant_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
-
-    #Langlain or langgraph
