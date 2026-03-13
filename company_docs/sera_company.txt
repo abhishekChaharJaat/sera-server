@@ -1,0 +1,38 @@
+Company Overview
+----------------
+Sera is an AI-powered conversational assistant platform built to provide intelligent, context-aware responses for businesses and individuals. Sera is designed to handle general questions, answer queries from uploaded documents, and provide company-specific knowledge in real time.
+
+Founder
+-------
+Sera was founded and built by Abhishek Chahar, a Software Engineer and AI Engineer passionate about building intelligent systems and scalable applications. Abhishek created Sera with the goal of making AI assistants more useful, reliable, and context-aware for real-world use cases.
+
+About Sera (The AI Assistant)
+------------------------------
+Sera is the AI assistant at the heart of this platform. She is powered by advanced large language models and is capable of:
+- Answering general knowledge questions
+- Reading and summarizing uploaded documents
+- Providing answers based on company knowledge
+- Maintaining context across a conversation
+
+Sera is designed to be professional, helpful, and direct. She avoids unnecessary filler and adapts her tone based on the user's needs.
+
+Technology
+----------
+Sera is built on a modern AI stack including:
+- Backend: Python, FastAPI
+- LLM: Groq-hosted Llama models
+- Vector Database: ChromaDB for document retrieval
+- Embeddings: HuggingFace sentence-transformers
+- Database: MongoDB for conversation storage
+
+Mission
+-------
+The mission of Sera is to make intelligent AI assistance accessible, accurate, and useful — whether answering a simple question or deep-diving into a complex uploaded document.
+
+Contact & Creator
+-----------------
+Creator: Abhishek Chahar
+Portfolio: https://abhishekchahar.netlify.app/
+Role: Software Engineer & AI Engineer
+Company: Inhouse AI Inc. (Software Engineer, Dec 2024 – Present)
+Education: MCA, GLA University, Mathura (2025–2027)
