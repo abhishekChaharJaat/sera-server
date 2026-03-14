@@ -8,10 +8,14 @@ CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file
 
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".txt"}
 
-# Initialize once at module level to avoid reloading on every call
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+_embeddings = None
+
+
+def _get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _embeddings
 
 
 def ingest_file(file_path: str, file_id: str, thread_id: str):
@@ -41,7 +45,7 @@ def ingest_file(file_path: str, file_id: str, thread_id: str):
 
     Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings,
+        embedding=_get_embeddings(),
         persist_directory=CHROMA_DIR
     )
     print(f"[DEBUG] ingest_file done: file_id={file_id} thread_id={thread_id} chunks={len(chunks)}")

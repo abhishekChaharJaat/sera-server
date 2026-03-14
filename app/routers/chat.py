@@ -33,17 +33,26 @@ llm = ChatGroq(
     temperature=0
 )
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+_embeddings = None
+_company_retriever = None
 
-# Company docs retriever — loaded once at module level
-company_vector_db = Chroma(
-    persist_directory=COMPANY_CHROMA_DIR,
-    embedding_function=embeddings
-)
-company_retriever = company_vector_db.as_retriever(search_kwargs={"k": 3})
 
+def _get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _embeddings
+
+
+def _get_company_retriever():
+    global _company_retriever
+    if _company_retriever is None:
+        company_vector_db = Chroma(
+            persist_directory=COMPANY_CHROMA_DIR,
+            embedding_function=_get_embeddings()
+        )
+        _company_retriever = company_vector_db.as_retriever(search_kwargs={"k": 3})
+    return _company_retriever
 
 
 class AttachmentInput(BaseModel):
@@ -162,7 +171,7 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
     # Otherwise search all files uploaded in this thread by thread_id
     thread_vector_db = Chroma(
         persist_directory=CHROMA_DIR,
-        embedding_function=embeddings
+        embedding_function=_get_embeddings()
     )
     current_attachments = last_user_msg.get("attachments", [])
     if current_attachments:
@@ -178,7 +187,7 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
 
     # ── RAG: Retrieve relevant chunks from company knowledge base ──
     company_docs = await asyncio.to_thread(
-        lambda: company_retriever.invoke(user_input)
+        lambda: _get_company_retriever().invoke(user_input)
     )
 
     # ── Build system prompt — inject retrieved context ──
@@ -238,6 +247,3 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
         yield sse({"type": "done", "id": assistant_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
-
-
