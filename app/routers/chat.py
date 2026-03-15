@@ -92,6 +92,16 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
     if thread.get("user_id") != auth_user.user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    MAX_FILES_PER_THREAD = 4
+
+    existing_files = thread.get("attached_files", 0)
+    incoming = len(body.attachments or [])
+    if existing_files + incoming > MAX_FILES_PER_THREAD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File limit reached. A thread can have at most {MAX_FILES_PER_THREAD} attached files."
+        )
+
     attachments = []
     for att in (body.attachments or []):
         file_id = str(uuid.uuid4())
@@ -131,9 +141,13 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
         **({"attachments": attachments} if attachments else {}),
     }
 
+    successful_uploads = sum(1 for a in attachments if a["status"] == "success")
     await db.threads.update_one(
         {"thread_id": thread_id},
-        {"$push": {"messages": user_msg}},
+        {
+            "$push": {"messages": user_msg},
+            "$inc": {"attached_files": successful_uploads},
+        },
     )
 
     async def stream():

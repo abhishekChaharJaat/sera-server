@@ -88,6 +88,7 @@ async def list_messages(thread_id: str, user: AuthUser = Depends(get_auth_user))
         "title": thread["title"],
         "messages": messages,
         "created_at": thread["created_at"],
+        "attached_files": thread.get("attached_files", 0),
     }
 
 # ========================== Shared messages =========================
@@ -110,4 +111,5 @@ async def list_messages(thread_id: str):
         "title": thread["title"],
         "messages": messages,
         "created_at": thread["created_at"],
+        "attached_files": thread.get("attached_files", 0),
     }
