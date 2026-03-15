@@ -5,7 +5,7 @@ import json
 import asyncio
 from bson import ObjectId
 from datetime import datetime, timezone
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 from pydantic import BaseModel
@@ -14,20 +14,18 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import Chroma
 from app.db.mongo import get_db
+from app.db.vector_store import get_thread_chroma_client, get_company_chroma_client, run_in_chroma_thread
 from app.auth import get_auth_user, AuthUser
 from app.prompts import AGENT_SYSTEM_PROMPT
-from app.helpers.ingets import ingest_file
+from app.helpers.ingets import ingest_file, read_file_content
 from app.helpers.chat_helpers import generate_title
 
 router = APIRouter()
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
-CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
-COMPANY_CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_company_db")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# LLM
 llm = ChatGroq(
     api_key=os.environ.get("GROQ_API_KEY"),
     model="llama-3.1-8b-instant",
@@ -53,7 +51,7 @@ def _get_thread_vector_db():
     global _thread_vector_db
     if _thread_vector_db is None:
         _thread_vector_db = Chroma(
-            persist_directory=CHROMA_DIR,
+            client=get_thread_chroma_client(),
             embedding_function=_get_embeddings()
         )
     return _thread_vector_db
@@ -63,16 +61,20 @@ def _get_company_vector_db():
     global _company_vector_db
     if _company_vector_db is None:
         _company_vector_db = Chroma(
-            persist_directory=COMPANY_CHROMA_DIR,
+            client=get_company_chroma_client(),
             embedding_function=_get_embeddings()
         )
     return _company_vector_db
 
 
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
 class AttachmentInput(BaseModel):
     filename: str
     content_type: str
-    data: str  # base64 encoded
+    data: str
 
 
 class ChatRequest(BaseModel):
@@ -80,22 +82,16 @@ class ChatRequest(BaseModel):
     attachments: Optional[List[AttachmentInput]] = []
 
 
-def sse(data: dict) -> str:
-    return f"data: {json.dumps(data)}\n\n"
-
-
 @router.post("/{thread_id}/send-message")
-async def send_message(thread_id: str, body: ChatRequest, background_tasks: BackgroundTasks, auth_user: AuthUser = Depends(get_auth_user)):
+async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-
     if thread.get("user_id") != auth_user.user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # Save uploaded files
     attachments = []
     for att in (body.attachments or []):
         file_id = str(uuid.uuid4())
@@ -111,8 +107,10 @@ async def send_message(thread_id: str, body: ChatRequest, background_tasks: Back
         if len(content) > 5 * 1024 * 1024:
             status, reason = "failed", "File size limit exceeded (max 5MB)"
         else:
-            status, reason = "processing", ""
-            background_tasks.add_task(ingest_file, file_path, file_id, thread_id)
+            status, reason = "success", ""
+            # Submit ingestion to dedicated ChromaDB thread (fire & forget)
+            from app.db.vector_store import get_chroma_executor
+            get_chroma_executor().submit(ingest_file, file_path, file_id, thread_id)
 
         attachments.append({
             "file_id": file_id,
@@ -149,100 +147,88 @@ async def send_message(thread_id: str, body: ChatRequest, background_tasks: Back
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-# ========================== Generate resopnse =========================
+# ========================== Generate response =========================
 
 @router.post("/{thread_id}/generate-response")
 async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
-    # Fetch thread and validate ownership
     thread = await db.threads.find_one({"thread_id": thread_id})
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-
     if thread.get("user_id") != auth_user.user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     messages = thread.get("messages", [])
 
-    # Get the last user message to generate a response for
-    last_user_msg = next(
-        (m for m in reversed(messages) if m["role"] == "user"), None
-    )
+    last_user_msg = next((m for m in reversed(messages) if m["role"] == "user"), None)
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="No user message found in thread")
 
-    # Check if this is the first message (no assistant reply yet) — used for title generation
     is_first_message = not any(m["role"] == "assistant" for m in messages)
 
-    # Use message content as query; if empty (file only), default to summarize
     user_input = last_user_msg["content"].strip()
-    if not user_input and last_user_msg.get("attachments"):
-        user_input = "Summarize the uploaded document briefly."
-
-    # ── RAG: Retrieve relevant chunks from uploaded documents ──
-    # If current message has attachments, search only those specific files by file_id
-    # Otherwise search all files uploaded in this thread by thread_id
-    thread_vector_db = _get_thread_vector_db()
     current_attachments = last_user_msg.get("attachments", [])
+    if not user_input and current_attachments:
+        user_input = "Summarize the uploaded document."
+
+    # ── Document context ──
+    # Current message has attachments → read file content directly (instant, no RAG needed)
+    # Follow-up question → RAG: similarity search across all docs in this thread
+    doc_context = ""
     if current_attachments:
-        file_ids = [a["file_id"] for a in current_attachments]
-       # $in ka matlab: match any of these file_ids. - $eq ka matlab: exactly match this file_id.
-        chroma_filter = {"file_id": {"$in": file_ids}} if len(file_ids) > 1 else {"file_id": {"$eq": file_ids[0]}}
+        parts = []
+        for att in current_attachments:
+            if att.get("status") == "success" and att.get("path"):
+                content = await asyncio.to_thread(read_file_content, att["path"])
+                if content:
+                    parts.append(f"[{att['filename']}]\n{content}")
+        doc_context = "\n\n---\n\n".join(parts)
     else:
+        # RAG: similarity search across all docs ingested in this thread
         chroma_filter = {"thread_id": {"$eq": thread_id}}
+        thread_docs = await run_in_chroma_thread(
+            lambda: _get_thread_vector_db().similarity_search(user_input, k=5, filter=chroma_filter)
+        )
+        doc_context = "\n\n".join(d.page_content for d in thread_docs)
 
-    thread_docs = await asyncio.to_thread(
-        lambda: thread_vector_db.similarity_search(user_input, k=5, filter=chroma_filter)
-    )
-
-    # ── RAG: Retrieve relevant chunks from company knowledge base ──
+    # ── Company knowledge base (RAG) ──
     company_docs = await asyncio.to_thread(
         lambda: _get_company_vector_db().similarity_search(user_input, k=3)
     )
 
-    # ── Build system prompt — inject retrieved context ──
-    # Start with base agent prompt, then append doc/company context if found
+    # ── System prompt ──
     system_content = AGENT_SYSTEM_PROMPT
-    if thread_docs:
-        doc_context = "\n\n".join(d.page_content for d in thread_docs)
+    if doc_context:
         system_content += f"\n\n[Uploaded Document Context]\n{doc_context}"
     if company_docs:
         company_context = "\n\n".join(d.page_content for d in company_docs)
         system_content += f"\n\n[Company Information]\n{company_context}"
 
-    # ── Build full message list for LLM ──
-    # System message first, then last 12 conversation messages, then current user message
+    # ── Message history ──
     all_messages = [SystemMessage(content=system_content)]
     for msg in messages[:-1][-12:]:
         if msg["role"] == "user":
-            all_messages.append(HumanMessage(content=msg["content"]))
+            all_messages.append(HumanMessage(content=msg["content"] or "📎 [file uploaded]"))
         elif msg["role"] == "assistant":
             all_messages.append(AIMessage(content=msg["content"]))
     all_messages.append(HumanMessage(content=user_input))
 
     async def stream():
-
-        # Generate and send thread title on the first message
         if is_first_message:
             title = await generate_title(last_user_msg["content"] or user_input)
-            await db.threads.update_one(
-                {"thread_id": thread_id},
-                {"$set": {"title": title}},
-            )
+            await db.threads.update_one({"thread_id": thread_id}, {"$set": {"title": title}})
             yield sse({"type": "title", "title": title})
 
         assistant_id = str(ObjectId())
         full_response = ""
 
-        # Stream LLM response chunk by chunk
         async for chunk in llm.astream(all_messages):
             delta = chunk.content
             if delta:
                 full_response += delta
                 yield sse({"type": "chunk", "content": delta})
 
-        # Save complete assistant message to MongoDB
         assistant_msg = {
             "_id": ObjectId(assistant_id),
             "role": "assistant",
@@ -253,8 +239,6 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
             {"thread_id": thread_id},
             {"$push": {"messages": assistant_msg}},
         )
-
-        # Signal stream completion
         yield sse({"type": "done", "id": assistant_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
