@@ -5,13 +5,13 @@ import json
 import asyncio
 from bson import ObjectId
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import Chroma
 from app.db.mongo import get_db
 from app.auth import get_auth_user, AuthUser
@@ -29,19 +29,33 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 llm = ChatGroq(
     api_key=os.environ.get("GROQ_API_KEY"),
-    model="llama-3.3-70b-versatile",
+    model="llama-3.1-8b-instant",
     temperature=0
 )
 
 _embeddings = None
+_thread_vector_db = None
 _company_retriever = None
 
 
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        _embeddings = HuggingFaceEndpointEmbeddings(
+            model="sentence-transformers/all-MiniLM-L6-v2",
+            huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        )
     return _embeddings
+
+
+def _get_thread_vector_db():
+    global _thread_vector_db
+    if _thread_vector_db is None:
+        _thread_vector_db = Chroma(
+            persist_directory=CHROMA_DIR,
+            embedding_function=_get_embeddings()
+        )
+    return _thread_vector_db
 
 
 def _get_company_retriever():
@@ -71,7 +85,7 @@ def sse(data: dict) -> str:
 
 
 @router.post("/{thread_id}/send-message")
-async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = Depends(get_auth_user)):
+async def send_message(thread_id: str, body: ChatRequest, background_tasks: BackgroundTasks, auth_user: AuthUser = Depends(get_auth_user)):
     db = get_db()
 
     thread = await db.threads.find_one({"thread_id": thread_id})
@@ -97,8 +111,8 @@ async def send_message(thread_id: str, body: ChatRequest, auth_user: AuthUser = 
         if len(content) > 5 * 1024 * 1024:
             status, reason = "failed", "File size limit exceeded (max 5MB)"
         else:
-            status, reason = "success", ""
-            await asyncio.to_thread(ingest_file, file_path, file_id, thread_id)
+            status, reason = "processing", ""
+            background_tasks.add_task(ingest_file, file_path, file_id, thread_id)
 
         attachments.append({
             "file_id": file_id,
@@ -169,10 +183,7 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
     # ── RAG: Retrieve relevant chunks from uploaded documents ──
     # If current message has attachments, search only those specific files by file_id
     # Otherwise search all files uploaded in this thread by thread_id
-    thread_vector_db = Chroma(
-        persist_directory=CHROMA_DIR,
-        embedding_function=_get_embeddings()
-    )
+    thread_vector_db = _get_thread_vector_db()
     current_attachments = last_user_msg.get("attachments", [])
     if current_attachments:
         file_ids = [a["file_id"] for a in current_attachments]

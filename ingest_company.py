@@ -2,7 +2,7 @@ import os
 import shutil
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_community.vectorstores import Chroma
 
 COMPANY_CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_company_db")
@@ -13,8 +13,9 @@ if os.path.exists(COMPANY_CHROMA_DIR):
     shutil.rmtree(COMPANY_CHROMA_DIR)
     print("Cleared existing company knowledge base.")
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+embeddings = HuggingFaceEndpointEmbeddings(
+    model="sentence-transformers/all-MiniLM-L6-v2",
+    huggingfacehub_api_token=os.environ.get("HUGGINGFACEHUB_API_TOKEN")
 )
 
 loader = TextLoader(FILE_PATH)
