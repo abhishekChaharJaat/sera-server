@@ -27,6 +27,7 @@ COMPANY_CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirnam
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# LLM
 llm = ChatGroq(
     api_key=os.environ.get("GROQ_API_KEY"),
     model="llama-3.1-8b-instant",
@@ -35,7 +36,7 @@ llm = ChatGroq(
 
 _embeddings = None
 _thread_vector_db = None
-_company_retriever = None
+_company_vector_db = None
 
 
 def _get_embeddings():
@@ -58,15 +59,14 @@ def _get_thread_vector_db():
     return _thread_vector_db
 
 
-def _get_company_retriever():
-    global _company_retriever
-    if _company_retriever is None:
-        company_vector_db = Chroma(
+def _get_company_vector_db():
+    global _company_vector_db
+    if _company_vector_db is None:
+        _company_vector_db = Chroma(
             persist_directory=COMPANY_CHROMA_DIR,
             embedding_function=_get_embeddings()
         )
-        _company_retriever = company_vector_db.as_retriever(search_kwargs={"k": 3})
-    return _company_retriever
+    return _company_vector_db
 
 
 class AttachmentInput(BaseModel):
@@ -198,7 +198,7 @@ async def generate_response(thread_id: str, auth_user: AuthUser = Depends(get_au
 
     # ── RAG: Retrieve relevant chunks from company knowledge base ──
     company_docs = await asyncio.to_thread(
-        lambda: _get_company_retriever().invoke(user_input)
+        lambda: _get_company_vector_db().similarity_search(user_input, k=3)
     )
 
     # ── Build system prompt — inject retrieved context ──

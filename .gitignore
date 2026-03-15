@@ -5,5 +5,4 @@ __pycache__/
 *.pyo
 .DS_Store
 chroma_db/
-chroma_company_db/
 uploads/
