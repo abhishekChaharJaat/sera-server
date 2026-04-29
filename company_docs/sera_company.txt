@@ -40,3 +40,4 @@ Portfolio: https://abhishekchahar.netlify.app/
 Role: Software Engineer & AI Engineer
 Company: Inhouse AI Inc. (Software Engineer, Dec 2024 – Present)
 Education: MCA, GLA University, Mathura (2025–2027)
+Love: Shreya. They first met on 12th October 2022 at the computer lab in GLA University.
